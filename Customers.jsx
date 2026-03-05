@@ -1,4 +1,5 @@
-import { act, use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 const API = "http://127.0.0.1:5000/api";
 
@@ -196,8 +197,7 @@ export default function Customers() {
                     placeholder="Email (optional)"
                     value={addForm.email}
                     onChange={(e) => setAddForm((f) => ({ ...f, email: e.target.value }))}
-                    style={{ padding: 8}}
-                    required
+                    style={{ padding: 8 }}
                 />
                 <input
                     placeholder="Store ID"
@@ -263,7 +263,11 @@ export default function Customers() {
 
                 return (
                   <tr key={c.customer_id}>
-                    <td>{c.customer_id}</td>
+                    <td>
+                      <Link to={`/customers/${c.customer_id}`}>
+                        {c.customer_id}
+                      </Link>
+                    </td>
 
                     <td>
                       {isEditing ? (
