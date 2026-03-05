@@ -104,7 +104,7 @@ def customers():
 
     if q:
         if q.isdigit():
-            where_sql += "AND (customer_id = %s OR first_name LIKE %s OR last_name LIKE %s)"
+            where_sql += " AND (customer_id = %s OR first_name LIKE %s OR last_name LIKE %s)"
             params = [int(q), f"%{q}%", f"%{q}%"]
         else:
             where_sql += " AND (first_name LIKE %s OR last_name LIKE %s)"
@@ -233,6 +233,187 @@ def delete_customer(customer_id):
     db.commit()
     db.close()
     return jsonify({"ok": True, "already_inactive": row["active"] == 0})
+
+@app.route("/api/top-actors")
+def top_actors():
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT a.actor_id,
+               a.first_name,
+               a.last_name,
+               COUNT(r.rental_id) AS rental_count
+        FROM actor a
+        JOIN film_actor fa ON a.actor_id = fa.actor_id
+        JOIN inventory i ON fa.film_id = i.film_id
+        JOIN rental r ON i.inventory_id = r.inventory_id
+        GROUP BY a.actor_id, a.first_name, a.last_name
+        ORDER BY rental_count DESC
+        LIMIT 5
+    """)
+    rows = cursor.fetchall()
+    db.close()
+    return jsonify(rows)
+
+@app.route("/api/actors/<int:actor_id>")
+def actor_details(actor_id):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT actor_id, first_name, last_name
+        FROM actor
+        WHERE actor_id = %s
+    """, (actor_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    if not row:
+        return jsonify({"error": "Actor not found"}), 404
+    return jsonify(row)
+
+@app.route("/api/actors/<int:actor_id>/top-films")
+def actor_top_films(actor_id):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT f.film_id,
+               f.title,
+               COUNT(r.rental_id) AS rental_count
+        FROM actor a
+        JOIN film_actor fa ON a.actor_id = fa.actor_id
+        JOIN film f ON fa.film_id = f.film_id
+        JOIN inventory i ON f.film_id = i.film_id
+        JOIN rental r ON i.inventory_id = r.inventory_id
+        WHERE a.actor_id = %s
+        GROUP BY f.film_id, f.title
+        ORDER BY rental_count DESC
+        LIMIT 5
+    """, (actor_id,))
+    rows = cursor.fetchall()
+    db.close()
+    return jsonify(rows)
+
+@app.route("/api/customers/<int:customer_id>", methods=["GET"])
+def customer_details(customer_id):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT customer_id, first_name, last_name, email, store_id, address_id, active, create_date
+        FROM customer
+        WHERE customer_id = %s
+    """, (customer_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    if not row:
+        return jsonify({"error": "Customer not found"}), 404
+    return jsonify(row)
+
+
+@app.route("/api/customers/<int:customer_id>/rentals", methods=["GET"])
+def customer_rentals(customer_id):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT r.rental_id,
+               r.rental_date,
+               r.return_date,
+               f.film_id,
+               f.title
+        FROM rental r
+        JOIN inventory i ON r.inventory_id = i.inventory_id
+        JOIN film f ON i.film_id = f.film_id
+        WHERE r.customer_id = %s
+        ORDER BY r.rental_date DESC
+        LIMIT 200
+    """, (customer_id,))
+    rows = cursor.fetchall()
+    db.close()
+    return jsonify(rows)
+
+@app.route("/api/rentals/<int:rental_id>/return", methods=["PUT"])
+def return_rental(rental_id):
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        UPDATE rental
+        SET return_date = NOW()
+        WHERE rental_id = %s AND return_date IS NULL
+    """, (rental_id,))
+    db.commit()
+
+    # rowcount == 0 means either rental_id doesn't exist OR already returned
+    if cursor.rowcount == 0:
+        db.close()
+        return jsonify({"error": "Rental not found or already returned"}), 404
+
+    db.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/rentals", methods=["POST"])
+def rent_film():
+    data = request.get_json(force=True) or {}
+
+    required = ["customer_id", "film_id"]
+    for k in required:
+        if k not in data:
+            return jsonify({"error": f"Missing field: {k}"}), 400
+
+    try:
+        customer_id = int(data["customer_id"])
+        film_id = int(data["film_id"])
+        staff_id = int(data.get("staff_id", 1))
+    except (ValueError, TypeError):
+        return jsonify({"error": "customer_id, film_id, staff_id must be numbers"}), 400
+
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+
+    try:
+        # Find an available inventory copy of this film:
+        # available = inventory rows that do NOT have a rental with return_date IS NULL
+        cursor.execute("""
+            SELECT i.inventory_id
+            FROM inventory i
+            LEFT JOIN rental r
+              ON r.inventory_id = i.inventory_id
+             AND r.return_date IS NULL
+            WHERE i.film_id = %s
+              AND r.rental_id IS NULL
+            LIMIT 1
+        """, (film_id,))
+        inv = cursor.fetchone()
+
+        if not inv:
+            db.close()
+            return jsonify({"error": "No available inventory for that film"}), 400
+
+        inventory_id = inv["inventory_id"]
+
+        # Insert rental
+        cursor2 = db.cursor()
+        cursor2.execute("""
+            INSERT INTO rental (rental_date, inventory_id, customer_id, staff_id)
+            VALUES (NOW(), %s, %s, %s)
+        """, (inventory_id, customer_id, staff_id))
+        db.commit()
+
+        rental_id = cursor2.lastrowid
+        cursor2.close()
+        db.close()
+
+        return jsonify({"ok": True, "rental_id": rental_id, "inventory_id": inventory_id}), 201
+
+    except Error as e:
+        db.rollback()
+        db.close()
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)
